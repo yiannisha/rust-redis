@@ -1,14 +1,18 @@
+use tokio::sync::mpsc;
 use tokio::net::{TcpListener, TcpStream};
 use mini_redis::{Connection, Frame};
 
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::sync::{Arc, Mutex};
-use std::hash::{DefaultHasher, Hasher, Hash};
+use std::hash::{Hasher, Hash};
 use std::ptr::hash;
 use std::ops::{Deref, Index};
 
 const NUM_SHARDS: usize = 3; 
+
+/* --- DB --- */
 
 // `Arc` is a counted reference (pointer)
 // `Mutex` is a **sync** mutex
@@ -31,7 +35,8 @@ impl Shards {
 
     fn shard_for(&self, key: &str) -> usize {
         let mut hasher = DefaultHasher::new();
-        hash(key, &mut hasher);
+        println!("received key: {}", key);
+        key.hash(&mut hasher);
         hasher.finish() as usize % self.0.len()
     }
 
@@ -41,11 +46,26 @@ impl Index<&str> for Shards {
     type Output = ShardType;
 
     fn index(&self, index: &str) -> &Self::Output {
-        &self.0[self.shard_for(index)]
+        let h = self.shard_for(index);
+        println!("hash for {}: {}", index, h);
+        &self.0[h]
     }
 }
 
 type ShardedDb = Arc<Shards>;
+
+/* --- MESSAGING --- */
+
+#[derive(Debug)]
+enum Command {
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        val: Bytes,
+    }
+}
 
 #[tokio::main]
 async fn main() {
