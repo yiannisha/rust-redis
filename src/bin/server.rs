@@ -6,46 +6,56 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::hash::{DefaultHasher, Hasher, Hash};
 use std::ptr::hash;
+use std::ops::{Deref, Index};
+
+const NUM_SHARDS: usize = 3; 
 
 // `Arc` is a counted reference (pointer)
 // `Mutex` is a **sync** mutex
 // `Bytes` is an `Arc<Vec<u8>>` with some extra utility
 type Db = Arc<Mutex<HashMap<String, Bytes>>>;
 
-type ShardedDb = Arc<Vec<Mutex<HashMap<String, Bytes>>>>;
+// a sharded version of `Db`
+type ShardType = Mutex<HashMap<String, Bytes>>;
 
-fn new_sharded_db(num_shards: usize) -> ShardedDb {
-    let mut db = Vec::with_capacity(num_shards);
-    for _ in 0..num_shards {
-        db.push(Mutex::new(HashMap::new()));
+#[derive(Debug)]
+struct Shards(Vec<ShardType>);
+
+impl Shards {
+
+    fn new(num_shards: usize) -> Self {
+        let mut db = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards { db.push(Mutex::new(HashMap::new())); }
+        Self(db)
     }
-    Arc::new(db)
+
+    fn shard_for(&self, key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        hash(key, &mut hasher);
+        hasher.finish() as usize % self.0.len()
+    }
+
 }
+
+impl Index<&str> for Shards {
+    type Output = ShardType;
+
+    fn index(&self, index: &str) -> &Self::Output {
+        &self.0[self.shard_for(index)]
+    }
+}
+
+type ShardedDb = Arc<Shards>;
 
 #[tokio::main]
 async fn main() {
     // Bind the listener to the address
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
-    println!("Listening...");
+    println!("Listening..."); 
 
-    let db = new_sharded_db(10);
-    println!("created db of size: {}", db.len());
-
-    // hash("test");
-    let five = 5;
-    let five_ref = &five;
-    let mut hasher = DefaultHasher::new();
-    hash(five_ref, &mut hasher);
-    let h = hasher.finish();
-    println!("{:?}", h);
-
-    let shard = db[h as usize % db.len()].lock().unwrap();
-    shard.insert("key", "value");
-    println!("{:?}", db);
-
-    return;
-
-    let db = Arc::new(Mutex::new(HashMap::new()));
+    let db: ShardedDb = Arc::new(Shards::new(NUM_SHARDS));
+    
+    println!("{:?}", db["test"]);
 
     loop {
         // The second item contains the IP and port of the new connection.
@@ -64,7 +74,7 @@ async fn main() {
     }
 }
 
-async fn process(socket: TcpStream, db: Db) {
+async fn process(socket: TcpStream, db: ShardedDb) {
     use mini_redis::Command::{self, Get, Set};
     use std::collections::HashMap;
 
@@ -79,13 +89,13 @@ async fn process(socket: TcpStream, db: Db) {
         let response = match Command::from_frame(frame).unwrap() {
             Set(cmd) => {
                 // the value is stored as `Bytes`
-                let mut db = db.lock().unwrap();
+                let mut db = db[cmd.key()].lock().unwrap();
                 db.insert(cmd.key().to_string(), cmd.value().clone());
                 Frame::Simple("OK".to_string())
             }
 
             Get(cmd) => {
-                let db = db.lock().unwrap();
+                let db = db[cmd.key()].lock().unwrap();
                 if let Some(value) = db.get(cmd.key()) {
                     // `Frame::Bulk` expects data to be of type `Bytes`.
                     // `&Vec<u8>` is converted to `Bytes` using `into()`.
